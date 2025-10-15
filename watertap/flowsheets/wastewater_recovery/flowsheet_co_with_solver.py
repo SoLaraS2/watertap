@@ -7,14 +7,20 @@ from idaes.core.solvers import get_solver
 from pyomo.network import Arc
 from pyomo.environ import TransformationFactory
 
-
 # WaterTAP props
 from watertap.core.wt_database import Database
 from watertap.core.zero_order_properties import WaterParameterBlock
 from watertap.property_models.seawater_prop_pack import SeawaterParameterBlock as NaClParameterBlock
+from watertap.property_models.multicomp_aq_sol_prop_pack import MCASParameterBlock
 
-# Units models
+# Unit models
 from watertap.unit_models.zero_order.ultra_filtration_zo import UltraFiltrationZO
+# import enums explicitly (they're not attributes of GAC)
+from watertap.unit_models.gac import (
+    GAC,
+    FilmTransferCoefficientType,
+    SurfaceDiffusionCoefficientType,
+)
 from components.chemical_addition_zo import ChemicalAdditionZO
 from components.ozone_aop_zo import OzoneAOPZO
 from components.uv_aop_zo import UVAOPZO
@@ -96,20 +102,30 @@ def build_flowsheet(use_ozone=True, use_uv=True):
     m.db = Database()
 
     # property packages
-    m.fs.props_wtp = WaterParameterBlock(solute_list=["tds","tss","toc","chlorine"])
+    m.fs.props_wtp  = WaterParameterBlock(solute_list=["tds","tss","toc","chlorine"])
     m.fs.props_nacl = NaClParameterBlock()
+    # MCAS needs MW for each solute
+    m.fs.props_mcas = MCASParameterBlock(
+        solute_list=["tds","tss","toc","chlorine"],
+        mw_data={
+            "tds": 0.05844*pyunits.kg/pyunits.mol,      # NaCl proxy
+            "tss": 0.10000*pyunits.kg/pyunits.mol,      # generic
+            "toc": 0.01200*pyunits.kg/pyunits.mol,      # carbon-equivalent proxy
+            "chlorine": 0.070906*pyunits.kg/pyunits.mol # Cl2
+        },
+    )
 
     # feed + UF
     m.fs.feed = StateJunction(property_package=m.fs.props_wtp)
-    m.fs.uf = UltraFiltrationZO(property_package=m.fs.props_wtp, database=m.db)
+    m.fs.uf   = UltraFiltrationZO(property_package=m.fs.props_wtp, database=m.db)
     m.fs.uf.recovery_frac_mass_H2O.fix(0.99)
     m.fs.uf.removal_frac_mass_comp[0,"tss"].fix(0.90)
     m.fs.uf.removal_frac_mass_comp[0,"tds"].fix(1e-3)
     m.fs.uf.energy_electric_flow_vol_inlet.fix(0.05)
     m.fs.uf.electricity[0].fix(0.0)
 
-    # translators + RO
-    m.fs.t_wtp_to_nacl = add_translator(m, "t_wtp_to_nacl", m.fs.props_wtp, m.fs.props_nacl)
+    # WTP<->NaCl translators + RO
+    m.fs.t_wtp_to_nacl = add_translator(m, "t_wtp_to_nacl", m.fs.props_wtp,  m.fs.props_nacl)
     m.fs.ro = ReverseOsmosis0D(property_package=m.fs.props_nacl)
     if hasattr(m.fs.ro, "area"): m.fs.ro.area.fix(1000.0)
     try: m.fs.ro.feed_side.properties_in[0].pressure.fix(15*pyunits.bar)
@@ -119,23 +135,33 @@ def build_flowsheet(use_ozone=True, use_uv=True):
     for j in m.fs.props_nacl.component_list:
         m.fs.ro.recovery_mass_phase_comp[0,"Liq",j].fix(0.45 if j=="H2O" else 0.01)
     ro = m.fs.ro
-    # water permeability (A) and salt permeability (B)
     if hasattr(ro, "A_comp") and (not ro.A_comp[0, "H2O"].fixed):
         ro.A_comp[0, "H2O"].fix(4e-12 * pyunits.m/pyunits.Pa/pyunits.s)
-
     m.fs.t_nacl_to_wtp = add_translator(m, "t_nacl_to_wtp", m.fs.props_nacl, m.fs.props_wtp)
 
-    # optional ozone / uv
-    last_stream = m.fs.t_nacl_to_wtp.outlet.outlet
+    # ozone/uv chain
+    last_port = m.fs.t_nacl_to_wtp.outlet.outlet
     if use_ozone:
         m.fs.ozone = OzoneAOPZO(property_package=m.fs.props_wtp, database=m.db)
-        m.fs.ozone_arc = Arc(source=last_stream, destination=m.fs.ozone.inlet)
-        last_stream = m.fs.ozone.treated
+        m.fs.ozone_arc = Arc(source=last_port, destination=m.fs.ozone.inlet)
+        last_port = m.fs.ozone.treated
         configure_ozone_defaults(m.fs.ozone)
     if use_uv:
         m.fs.uv_aop = UVAOPZO(property_package=m.fs.props_wtp, database=m.db)
-        m.fs.uv_arc = Arc(source=last_stream, destination=m.fs.uv_aop.inlet)
-        last_stream = m.fs.uv_aop.treated
+        m.fs.uv_arc = Arc(source=last_port, destination=m.fs.uv_aop.inlet)
+        last_port = m.fs.uv_aop.treated
+
+    # WTP -> MCAS -> GAC -> WTP
+    m.fs.t_wtp_to_mcas = add_translator(m, "t_wtp_to_mcas", m.fs.props_wtp,  m.fs.props_mcas)
+    m.fs.t_mcas_to_wtp = add_translator(m, "t_mcas_to_wtp", m.fs.props_mcas, m.fs.props_wtp)
+
+    m.fs.gac = GAC(
+        property_package=m.fs.props_mcas,
+        target_species=["toc"],
+        film_transfer_coefficient_type=FilmTransferCoefficientType.fixed,
+        surface_diffusion_coefficient_type=SurfaceDiffusionCoefficientType.fixed,
+        finite_elements_ss_approximation=5,
+    )
 
     # chlorine + product
     m.fs.cl2 = ChemicalAdditionZO(property_package=m.fs.props_wtp, database=m.db, process_subtype="chlorine")
@@ -145,22 +171,21 @@ def build_flowsheet(use_ozone=True, use_uv=True):
     m.fs.product = StateJunction(property_package=m.fs.props_wtp)
 
     # arcs
-    m.fs.feed_to_uf = Arc(source=m.fs.feed.outlet, destination=m.fs.uf.inlet)
-    m.fs.uf_to_trans = Arc(source=m.fs.uf.treated, destination=m.fs.t_wtp_to_nacl.inlet.inlet)
+    m.fs.feed_to_uf   = Arc(source=m.fs.feed.outlet,                 destination=m.fs.uf.inlet)
+    m.fs.uf_to_trans  = Arc(source=m.fs.uf.treated,                  destination=m.fs.t_wtp_to_nacl.inlet.inlet)
+    m.fs.arc_to_mcas  = Arc(source=last_port,                        destination=m.fs.t_wtp_to_mcas.inlet.inlet)
+    m.fs.arc_mcas_gac = Arc(source=m.fs.t_wtp_to_mcas.outlet.outlet, destination=m.fs.gac.inlet)
+    m.fs.arc_gac_wtp  = Arc(source=m.fs.gac.outlet,                  destination=m.fs.t_mcas_to_wtp.inlet.inlet)
+    m.fs.arc_to_cl2   = Arc(source=m.fs.t_mcas_to_wtp.outlet.outlet, destination=m.fs.cl2.inlet)
+    m.fs.arc_product  = Arc(source=m.fs.cl2.outlet,                  destination=m.fs.product.inlet)
 
     TransformationFactory("network.expand_arcs").apply_to(m)
 
-    # tie states (RO, Cl2)
+    # tie states (RO translators)
     _tie_states(m.fs, m.fs.t_wtp_to_nacl.outlet.properties[0], m.fs.ro.feed_side.properties_in[0],
                 list(m.fs.props_nacl.component_list), list(m.fs.props_nacl.component_list))
     _tie_states(m.fs, m.fs.ro.mixed_permeate[0], m.fs.t_nacl_to_wtp.inlet.properties[0],
                 list(m.fs.props_nacl.component_list), list(m.fs.props_nacl.component_list))
-
-    cl2_src = _treated_props(m.fs.uv_aop) if use_uv else ( _treated_props(m.fs.ozone) if use_ozone else m.fs.t_nacl_to_wtp.outlet.properties[0])
-    _tie_states(m.fs, cl2_src, m.fs.cl2.properties[0],
-                list(m.fs.props_wtp.component_list), list(m.fs.props_wtp.component_list))
-    _tie_states(m.fs, m.fs.cl2.properties[0], m.fs.product.properties[0],
-                list(m.fs.props_wtp.component_list), list(m.fs.props_wtp.component_list))
 
     # nominal feed
     f = m.fs.feed.properties[0]
@@ -169,6 +194,7 @@ def build_flowsheet(use_ozone=True, use_uv=True):
     f.flow_mass_comp["tss"].fix(0.01)
     f.flow_mass_comp["toc"].fix(0.5)
     f.flow_mass_comp["chlorine"].fix(1e-12)
+    
 
     try:
         set_scaling_factor(m.fs.uf.properties_in[0].flow_mass_comp["tss"], 1e3)
@@ -179,7 +205,8 @@ def build_flowsheet(use_ozone=True, use_uv=True):
 # ----------------- run + print -----------------
 if __name__ == "__main__":
     m = build_flowsheet(use_ozone=True, use_uv=True)
-    # --- ozone knobs ---
+
+    # ozone knobs
     if hasattr(m.fs, "ozone"):
         a = m.fs.ozone
         if hasattr(a, "contact_time"):       a.contact_time[0].fix(8.0)
@@ -188,49 +215,46 @@ if __name__ == "__main__":
         if hasattr(a, "chemical_flow_mass"): a.chemical_flow_mass[0].unfix()
         if hasattr(a, "mass_transfer_efficiency"): a.mass_transfer_efficiency[0].fix(0.85)
         if hasattr(a, "specific_energy_coeff"): a.specific_energy_coeff[0].fix(0.02)
-
-    # --- uv knobs ---
-    if hasattr(m.fs, "uv_aop"):
-        u = m.fs.uv_aop
-        if hasattr(u, "uv_reduced_equivalent_dose"): u.uv_reduced_equivalent_dose[0].fix(100 * pyunits.mJ/pyunits.cm**2)
-        if hasattr(u, "uv_transmittance_in"):        u.uv_transmittance_in[0].fix(0.90)
-        if hasattr(u, "energy_electric_flow_vol_inlet"): u.energy_electric_flow_vol_inlet.fix(0.05)
-        if hasattr(u, "oxidant_dose"):              u.oxidant_dose[0].fix(5.0)
-        if hasattr(u, "chemical_flow_mass"):        u.chemical_flow_mass[0].unfix()
-        if hasattr(u, "electricity"):               u.electricity[0].fix(0.0)
-    if hasattr(m.fs, "ozone") and hasattr(m.fs.ozone, "chemical_flow_mass"):
-        m.fs.ozone.chemical_flow_mass[0].fix(0.0 * pyunits.kg/pyunits.s)
-
-    if hasattr(m.fs, "uv_aop") and hasattr(m.fs.uv_aop, "chemical_flow_mass"):
-        m.fs.uv_aop.chemical_flow_mass[0].fix(0.0 * pyunits.kg/pyunits.s)
-    if hasattr(m.fs, "ozone"):
-        a = m.fs.ozone
         if hasattr(a, "ozone_toc_ratio"):      a.ozone_toc_ratio[0].fix(1.0)
         if hasattr(a, "oxidant_ozone_ratio"):  a.oxidant_ozone_ratio[0].fix(1.0)
-        if hasattr(a, "oxidant_dose"):         a.oxidant_dose[0].fix(3.0)
-        if hasattr(a, "contact_time"):         a.contact_time[0].fix(8.0)
-        if hasattr(a, "concentration_time"):   a.concentration_time[0].fix(5.0)   # <- was free
-        if hasattr(a, "chemical_flow_mass"):   a.chemical_flow_mass[0].fix(0.0)   # <- was free
-        if hasattr(a, "mass_transfer_efficiency"): a.mass_transfer_efficiency[0].fix(0.85)
-        if hasattr(a, "specific_energy_coeff"):    a.specific_energy_coeff[0].fix(0.02)
+        if hasattr(a, "concentration_time"):   a.concentration_time[0].fix(5.0)
+        if hasattr(a, "chemical_flow_mass"):   a.chemical_flow_mass[0].fix(0.0)
 
-    # UV-AOP: dose-driven; kill alt mass-flow
+    # uv knobs
     if hasattr(m.fs, "uv_aop"):
         u = m.fs.uv_aop
         if hasattr(u, "uv_reduced_equivalent_dose"): u.uv_reduced_equivalent_dose[0].fix(100 * pyunits.mJ/pyunits.cm**2)
         if hasattr(u, "uv_transmittance_in"):        u.uv_transmittance_in[0].fix(0.90)
         if hasattr(u, "energy_electric_flow_vol_inlet"): u.energy_electric_flow_vol_inlet.fix(0.05)
         if hasattr(u, "oxidant_dose"):              u.oxidant_dose[0].fix(5.0)
-        if hasattr(u, "chemical_flow_mass"):        u.chemical_flow_mass[0].fix(0.0)  # <- was free
+        if hasattr(u, "chemical_flow_mass"):        u.chemical_flow_mass[0].fix(0.0)
         if hasattr(u, "electricity"):               u.electricity[0].fix(0.0)
 
-    # CL2: fix bookkeeping vars so they don't count toward DOF
+    # GAC knobs / DOF closure
+    if hasattr(m.fs, "gac"):
+        m.fs.gac.operational_time.fix(1e5 * pyunits.s)
+        m.fs.gac.bed_volumes_treated.fix(1000.0)
+        g = m.fs.gac
+        g.freund_k.fix(10.0)
+        g.freund_ninv.fix(0.5)
+        g.ds.fix(1e-14 * pyunits.m**2/pyunits.s)
+        g.kf.fix(1e-5  * pyunits.m/pyunits.s)
+        g.particle_dens_app.fix(1000 * pyunits.kg/pyunits.m**3)
+        g.particle_dens_bulk.fix(500  * pyunits.kg/pyunits.m**3)
+        g.particle_dia.fix(0.001 * pyunits.m)
+        g.velocity_sup.fix(0.001 * pyunits.m/pyunits.s)
+        g.ebct.fix(500 * pyunits.s)
+        g.conc_ratio_replace.fix(0.10)
+        g.a0.fix(1.0); g.a1.fix(1.0)
+        g.b0.fix(0.1); g.b1.fix(0.1); g.b2.fix(0.1); g.b3.fix(0.1); g.b4.fix(0.1)
+
+    # CL2: bookkeeping
     if hasattr(m.fs, "cl2"):
         c = m.fs.cl2
-        if hasattr(c, "solution_density"):     c.solution_density.fix(1000 * pyunits.kg/pyunits.m**3)  # <- was free
-        if hasattr(c, "ratio_in_solution"):    c.ratio_in_solution.fix(0.125) 
-    
-    from pyomo.core.base.var import Var
+        if hasattr(c, "solution_density"):  c.solution_density.fix(1000 * pyunits.kg/pyunits.m**3)
+        if hasattr(c, "ratio_in_solution"): c.ratio_in_solution.fix(0.125)
+
+    # debug: list free
     def list_free(prefix, blk, limit=40):
         print(f"\n[free vars] {prefix}")
         k = 0
@@ -241,14 +265,14 @@ if __name__ == "__main__":
         if k == 0: print(" (none)")
         return k
 
+    list_free("UF", m.fs.uf)
     list_free("RO", m.fs.ro)
     if hasattr(m.fs, "ozone"):  list_free("Ozone", m.fs.ozone)
     if hasattr(m.fs, "uv_aop"): list_free("UV-AOP", m.fs.uv_aop)
+    if hasattr(m.fs, "gac"):    list_free("GAC", m.fs.gac)
     list_free("Cl2", m.fs.cl2)
-    list_free("UF", m.fs.uf)
 
     print("DOF:", degrees_of_freedom(m))
-    
 
     solver = get_solver()
     results = solver.solve(m, tee=True)
@@ -258,11 +282,9 @@ if __name__ == "__main__":
     def print_stream(label, props):
         print(f"\n--- {label} ---")
         if hasattr(props, "flow_mass_comp"):
-            # WaterParameterBlock style
             for c in props.flow_mass_comp:
                 print(f"{c}: {value(props.flow_mass_comp[c]):.4f} {pyunits.get_units(props.flow_mass_comp[c])}")
         elif hasattr(props, "flow_mass_phase_comp"):
-            # NaClParameterBlock style
             for (p, c) in props.flow_mass_phase_comp:
                 if str(p) == "Liq":
                     v = props.flow_mass_phase_comp[p, c]
@@ -274,12 +296,14 @@ if __name__ == "__main__":
         if hasattr(props, "temperature"):
             print(f"Temperature: {value(props.temperature):.2f} {pyunits.get_units(props.temperature)}")
 
-    # after solver.solve(...)
     print("\n=== Stream Results ===")
-    print_stream("Feed", m.fs.feed.properties[0])
-    print_stream("UF permeate", m.fs.uf.properties_treated[0])
-    print_stream("RO permeate", m.fs.ro.mixed_permeate[0])
-    print_stream("Product", m.fs.product.properties[0])
+    print_stream("Feed",          m.fs.feed.properties[0])
+    print_stream("UF permeate",   m.fs.uf.properties_treated[0])
+    print_stream("RO permeate",   m.fs.ro.mixed_permeate[0])
+    if hasattr(m.fs, "gac"):
+        print_stream("GAC inlet (MCAS)",  m.fs.gac.process_flow.properties_in[0])
+        print_stream("GAC outlet (MCAS)", m.fs.gac.process_flow.properties_out[0])
+        print_stream("GAC removed (adsorbed)", m.fs.gac.gac_removed[0])
+    print_stream("Product",       m.fs.product.properties[0])
     print("DOF:", degrees_of_freedom(m))
-
 
